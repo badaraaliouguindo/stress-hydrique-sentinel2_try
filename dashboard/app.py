@@ -25,7 +25,9 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 @st.cache_resource
 def init_gee():
+
     try:
+
         key_data = dict(st.secrets["gee"])
 
         credentials = ee.ServiceAccountCredentials(
@@ -34,11 +36,15 @@ def init_gee():
         )
 
         ee.Initialize(credentials)
+
         return True
 
     except Exception as e:
+
         st.error(f"Erreur GEE : {e}")
+
         return False
+
 
 gee_ok = init_gee()
 
@@ -47,7 +53,9 @@ gee_ok = init_gee()
 # ─────────────────────────────────────────────
 @st.cache_resource
 def load_models():
+
     try:
+
         model_dir = "dashboard/models"
 
         with open(f"{model_dir}/random_forest_v1.pkl", "rb") as f:
@@ -62,8 +70,11 @@ def load_models():
         return rf_model, xgb_model, scaler
 
     except Exception as e:
+
         st.error(f"Erreur chargement modèles : {e}")
+
         return None, None, None
+
 
 rf_model, xgb_model, scaler = load_models()
 
@@ -71,7 +82,7 @@ rf_model, xgb_model, scaler = load_models()
 # TITRE
 # ─────────────────────────────────────────────
 st.title("🌿 Détection du Stress Hydrique")
-st.markdown("### Irrigation intelligente via Sentinel-2 & Données Météo")
+st.markdown("### Irrigation intelligente via Sentinel-2 & IA")
 st.divider()
 
 # ─────────────────────────────────────────────
@@ -85,25 +96,21 @@ with st.sidebar:
 
     date_debut = st.date_input(
         "Date début",
-        value=datetime(2024, 1, 1),
-        min_value=datetime(2020, 1, 1),
-        max_value=datetime(2025, 12, 31)
+        value=datetime(2024, 1, 1)
     )
 
     date_fin = st.date_input(
         "Date fin",
-        value=datetime(2024, 3, 31),
-        min_value=datetime(2020, 1, 1),
-        max_value=datetime(2025, 12, 31)
+        value=datetime(2024, 3, 31)
     )
 
-    st.subheader("🛰️ Indice spectral")
+    st.subheader("🛰️ Indice")
 
     indice = st.selectbox(
         "Indice à afficher",
         [
-            "RGB (couleurs naturelles)",
-            "NIR (fausses couleurs)",
+            "RGB",
+            "NIR",
             "NDVI",
             "NDWI",
             "MSI"
@@ -113,13 +120,13 @@ with st.sidebar:
     st.subheader("📍 Zone d'étude")
 
     lat_centre = st.number_input(
-        "Latitude centre",
+        "Latitude",
         value=34.50,
         format="%.4f"
     )
 
     lon_centre = st.number_input(
-        "Longitude centre",
+        "Longitude",
         value=-6.275,
         format="%.4f"
     )
@@ -132,9 +139,9 @@ with st.sidebar:
     )
 
     analyser = st.button(
-        "🔍 Analyser la zone",
+        "🔍 Analyser",
         type="primary",
-        use_container_width=True
+        width="stretch"
     )
 
 # ─────────────────────────────────────────────
@@ -142,9 +149,12 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 st.subheader("🗺️ Carte interactive")
 
-col_carte, col_info = st.columns([2, 1])
+col_map, col_info = st.columns([2, 1])
 
-with col_carte:
+image = None
+zone = None
+
+with col_map:
 
     m = folium.Map(
         location=[lat_centre, lon_centre],
@@ -155,138 +165,135 @@ with col_carte:
 
     if gee_ok and analyser:
 
-        with st.spinner("Chargement Sentinel-2..."):
+        try:
 
-            try:
+            zone = ee.Geometry.Point(
+                [lon_centre, lat_centre]
+            ).buffer(buffer_km * 1000)
 
-                zone = ee.Geometry.Point(
-                    [lon_centre, lat_centre]
-                ).buffer(buffer_km * 1000)
+            def mask_clouds(img):
 
-                def masquer_nuages(img):
+                scl = img.select("SCL")
 
-                    scl = img.select("SCL")
-
-                    mask = (
-                        scl.eq(4)
-                        .Or(scl.eq(5))
-                        .Or(scl.eq(6))
-                        .Or(scl.eq(7))
-                    )
-
-                    return img.updateMask(mask).divide(10000)
-
-                collection = (
-                    ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-                    .filterBounds(zone)
-                    .filterDate(str(date_debut), str(date_fin))
-                    .filter(
-                        ee.Filter.lt(
-                            "CLOUDY_PIXEL_PERCENTAGE",
-                            20
-                        )
-                    )
-                    .map(masquer_nuages)
+                mask = (
+                    scl.eq(4)
+                    .Or(scl.eq(5))
+                    .Or(scl.eq(6))
+                    .Or(scl.eq(7))
                 )
 
-                image = collection.median()
+                return img.updateMask(mask).divide(10000)
 
-                if indice == "RGB (couleurs naturelles)":
-
-                    viz = {
-                        "bands": ["B4", "B3", "B2"],
-                        "min": 0,
-                        "max": 0.3,
-                        "gamma": 1.4
-                    }
-
-                elif indice == "NIR (fausses couleurs)":
-
-                    viz = {
-                        "bands": ["B8", "B4", "B3"],
-                        "min": 0,
-                        "max": 0.4,
-                        "gamma": 1.4
-                    }
-
-                elif indice == "NDVI":
-
-                    image = image.normalizedDifference(
-                        ["B8", "B4"]
+            collection = (
+                ee.ImageCollection(
+                    "COPERNICUS/S2_SR_HARMONIZED"
+                )
+                .filterBounds(zone)
+                .filterDate(
+                    str(date_debut),
+                    str(date_fin)
+                )
+                .filter(
+                    ee.Filter.lt(
+                        "CLOUDY_PIXEL_PERCENTAGE",
+                        20
                     )
+                )
+                .map(mask_clouds)
+            )
 
-                    viz = {
-                        "min": -0.2,
-                        "max": 0.8,
-                        "palette": [
-                            "d73027",
-                            "f46d43",
-                            "fdae61",
-                            "ffffbf",
-                            "a6d96a",
-                            "1a9850"
-                        ]
-                    }
+            image = collection.median()
 
-                elif indice == "NDWI":
+            if indice == "RGB":
 
-                    image = image.normalizedDifference(
-                        ["B3", "B8"]
-                    )
+                viz = {
+                    "bands": ["B4", "B3", "B2"],
+                    "min": 0,
+                    "max": 0.3
+                }
 
-                    viz = {
-                        "min": -0.8,
-                        "max": 0.2,
-                        "palette": [
-                            "d73027",
-                            "f46d43",
-                            "ffffbf",
-                            "74add1",
-                            "4575b4"
-                        ]
-                    }
+            elif indice == "NIR":
 
-                elif indice == "MSI":
+                viz = {
+                    "bands": ["B8", "B4", "B3"],
+                    "min": 0,
+                    "max": 0.4
+                }
 
-                    image = image.select("B11").divide(
-                        image.select("B8")
-                    )
+            elif indice == "NDVI":
 
-                    viz = {
-                        "min": 0.4,
-                        "max": 1.5,
-                        "palette": [
-                            "1a9850",
-                            "a6d96a",
-                            "ffffbf",
-                            "f46d43",
-                            "d73027"
-                        ]
-                    }
+                image = image.normalizedDifference(
+                    ["B8", "B4"]
+                )
 
-                map_id = image.getMapId(viz)
+                viz = {
+                    "min": -0.2,
+                    "max": 0.8,
+                    "palette": [
+                        "red",
+                        "yellow",
+                        "green"
+                    ]
+                }
 
-                folium.TileLayer(
-                    tiles=map_id["tile_fetcher"].url_format,
-                    attr="Google Earth Engine",
-                    overlay=True,
-                    name=indice
-                ).add_to(m)
+            elif indice == "NDWI":
 
-                folium.Circle(
-                    location=[lat_centre, lon_centre],
-                    radius=buffer_km * 1000,
-                    color="green",
-                    fill=True,
-                    fill_opacity=0.1
-                ).add_to(m)
+                image = image.normalizedDifference(
+                    ["B3", "B8"]
+                )
 
-                folium.LayerControl().add_to(m)
+                viz = {
+                    "min": -0.5,
+                    "max": 0.5,
+                    "palette": [
+                        "brown",
+                        "yellow",
+                        "blue"
+                    ]
+                }
 
-                st.success("Image Sentinel-2 chargée")
+            elif indice == "MSI":
 
-            except Exception as e:
-                st.error(f"Erreur carte : {e}")
+                image = image.select(
+                    "B11"
+                ).divide(
+                    image.select("B8")
+                )
+
+                viz = {
+                    "min": 0.4,
+                    "max": 1.5,
+                    "palette": [
+                        "green",
+                        "yellow",
+                        "red"
+                    ]
+                }
+
+            map_id = image.getMapId(viz)
+
+            folium.TileLayer(
+                tiles=map_id["tile_fetcher"].url_format,
+                attr="Google Earth Engine",
+                overlay=True,
+                name=indice
+            ).add_to(m)
+
+            folium.Circle(
+                location=[lat_centre, lon_centre],
+                radius=buffer_km * 1000,
+                color="green",
+                fill=True,
+                fill_opacity=0.1
+            ).add_to(m)
+
+            folium.LayerControl().add_to(m)
+
+            st.success("Image Sentinel-2 chargée")
+
+        except Exception as e:
+
+            st.error(f"Erreur GEE : {e}")
 
     st_folium(m, width=700, height=500)
 
@@ -358,51 +365,49 @@ def get_meteo(lat, lon, debut, fin):
 
     return None
 
+
 df_meteo = None
 
 if analyser:
 
-    with st.spinner("Chargement météo..."):
-
-        df_meteo = get_meteo(
-            lat_centre,
-            lon_centre,
-            date_debut,
-            date_fin
-        )
+    df_meteo = get_meteo(
+        lat_centre,
+        lon_centre,
+        date_debut,
+        date_fin
+    )
 
     if df_meteo is not None:
 
-        col1, col2, col3, col4 = st.columns(4)
+        c1, c2, c3, c4 = st.columns(4)
 
-        with col1:
+        with c1:
             st.metric(
-                "Température max moyenne",
+                "Température max",
                 f"{df_meteo['temperature_2m_max'].mean():.1f} °C"
             )
 
-        with col2:
+        with c2:
             st.metric(
                 "Précipitations",
                 f"{df_meteo['precipitation_sum'].sum():.1f} mm"
             )
 
-        with col3:
+        with c3:
             st.metric(
-                "ETo moyenne",
+                "ETo",
                 f"{df_meteo['et0_fao_evapotranspiration'].mean():.2f}"
             )
 
-        with col4:
+        with c4:
             st.metric(
-                "Déficit moyen",
+                "Déficit",
                 f"{df_meteo['deficit'].mean():.2f}"
             )
 
-        # GRAPH TEMP
-        fig_temp = go.Figure()
+        fig = go.Figure()
 
-        fig_temp.add_trace(
+        fig.add_trace(
             go.Scatter(
                 x=df_meteo["time"],
                 y=df_meteo["temperature_2m_max"],
@@ -410,7 +415,7 @@ if analyser:
             )
         )
 
-        fig_temp.add_trace(
+        fig.add_trace(
             go.Scatter(
                 x=df_meteo["time"],
                 y=df_meteo["temperature_2m_min"],
@@ -418,13 +423,9 @@ if analyser:
             )
         )
 
-        fig_temp.update_layout(
-            title="Températures"
-        )
-
         st.plotly_chart(
-            fig_temp,
-            use_container_width=True
+            fig,
+            width="stretch"
         )
 
 # ─────────────────────────────────────────────
@@ -432,148 +433,236 @@ if analyser:
 # ─────────────────────────────────────────────
 st.divider()
 
-st.subheader("🤖 Intelligence Artificielle")
+st.subheader("🤖 Analyse IA")
 
-if analyser and df_meteo is not None:
+if (
+    analyser
+    and df_meteo is not None
+    and image is not None
+):
 
-    if rf_model is not None and xgb_model is not None:
+    try:
 
+        # ─────────────────────────────
+        # VARIABLES METEO
+        # ─────────────────────────────
+        temp_max = df_meteo[
+            "temperature_2m_max"
+        ].mean()
+
+        eto = df_meteo[
+            "et0_fao_evapotranspiration"
+        ].mean()
+
+        amplitude = (
+            df_meteo["temperature_2m_max"]
+            - df_meteo["temperature_2m_min"]
+        ).mean()
+
+        # ─────────────────────────────
+        # NDVI
+        # ─────────────────────────────
         try:
 
-            deficit_moy = df_meteo["deficit"].mean()
-
-            temp_moy = df_meteo[
-                "temperature_2m_max"
-            ].mean()
-
-            precip_total = df_meteo[
-                "precipitation_sum"
-            ].sum()
-
-            et0_moy = df_meteo[
-                "et0_fao_evapotranspiration"
-            ].mean()
-
-            nb_jours = len(df_meteo)
-
-            # FEATURES
-            features = pd.DataFrame([{
-                "temperature_max": temp_moy,
-                "precipitation": precip_total / nb_jours,
-                "et0": et0_moy,
-                "deficit": deficit_moy
-            }])
-
-            # SCALE
-            X_scaled = scaler.transform(features)
-
-            # PREDICTIONS
-            rf_pred = rf_model.predict(X_scaled)[0]
-            xgb_pred = xgb_model.predict(X_scaled)[0]
-
-            # SCORE FINAL
-            score = int(
-                ((rf_pred + xgb_pred) / 2) * 100
+            ndvi_img = image.normalizedDifference(
+                ["B8", "B4"]
             )
 
-            score = max(0, min(score, 100))
+            ndvi_val = ndvi_img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=zone,
+                scale=20
+            ).getInfo()
 
-            # LABEL
-            if score < 25:
+            ndvi = list(
+                ndvi_val.values()
+            )[0]
 
-                label = "✅ Pas de stress"
-                conseil = (
-                    "Aucune irrigation nécessaire."
-                )
+        except:
+            ndvi = 0
 
-            elif score < 50:
+        # ─────────────────────────────
+        # NDWI
+        # ─────────────────────────────
+        try:
 
-                label = "⚠️ Risque faible"
-                conseil = (
-                    "Surveillance recommandée."
-                )
+            ndwi_img = image.normalizedDifference(
+                ["B3", "B8"]
+            )
 
-            elif score < 75:
+            ndwi_val = ndwi_img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=zone,
+                scale=20
+            ).getInfo()
 
-                label = "🟠 Stress modéré"
-                conseil = (
-                    "Irrigation recommandée."
-                )
+            ndwi = list(
+                ndwi_val.values()
+            )[0]
 
-            else:
+        except:
+            ndwi = 0
 
-                label = "🔴 Stress sévère"
-                conseil = (
-                    "Irrigation urgente."
-                )
+        # ─────────────────────────────
+        # MSI
+        # ─────────────────────────────
+        try:
 
-            col_s1, col_s2, col_s3 = st.columns(3)
+            msi_img = image.select(
+                "B11"
+            ).divide(
+                image.select("B8")
+            )
 
-            with col_s1:
+            msi_val = msi_img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=zone,
+                scale=20
+            ).getInfo()
 
-                st.metric(
-                    "Score IA",
-                    f"{score}/100"
-                )
+            msi = list(
+                msi_val.values()
+            )[0]
 
-                st.progress(score / 100)
+        except:
+            msi = 0
 
-            with col_s2:
+        # ─────────────────────────────
+        # FEATURES APPROXIMATIVES
+        # ─────────────────────────────
+        ndre = ndvi * 0.85
+        cri = (1 - ndvi) * 0.5
+        lai = ndvi * 3
 
-                st.markdown("### Niveau")
+        # ─────────────────────────────
+        # FEATURES FINALES
+        # ─────────────────────────────
+        features = pd.DataFrame([{
+            "NDVI": ndvi,
+            "NDWI": ndwi,
+            "MSI": msi,
+            "NDRE": ndre,
+            "CRI": cri,
+            "LAI": lai,
+            "SPI_30j": 0,
+            "deficit_cum_30j": 0,
+            "HSI_cum_30j": 0,
+            "temp_max": temp_max,
+            "ETo": eto,
+            "amplitude_thermique": amplitude
+        }])
 
-                st.markdown(f"## {label}")
+        # ─────────────────────────────
+        # SCALE
+        # ─────────────────────────────
+        X_scaled = scaler.transform(features)
 
-            with col_s3:
+        # ─────────────────────────────
+        # PREDICTIONS
+        # ─────────────────────────────
+        rf_pred = rf_model.predict(X_scaled)[0]
 
-                st.markdown("### Recommandation")
+        xgb_pred = xgb_model.predict(X_scaled)[0]
 
-                st.info(conseil)
+        score = int(
+            ((rf_pred + xgb_pred) / 2) * 33
+        )
 
-                eau = abs(deficit_moy) * 0.7
+        score = max(0, min(score, 100))
 
-                st.warning(
-                    f"💧 Eau estimée : {eau:.1f} mm/j"
-                )
+        # ─────────────────────────────
+        # LABELS
+        # ─────────────────────────────
+        if score < 25:
 
-            # DETAILS MODELES
-            st.divider()
+            label = "✅ Pas de stress"
 
-            st.subheader("📈 Résultats modèles")
+            conseil = (
+                "Aucune irrigation nécessaire."
+            )
 
-            c1, c2 = st.columns(2)
+        elif score < 50:
 
-            with c1:
-                st.metric(
-                    "Random Forest",
-                    f"{rf_pred:.2f}"
-                )
+            label = "⚠️ Risque"
 
-            with c2:
-                st.metric(
-                    "XGBoost",
-                    f"{xgb_pred:.2f}"
-                )
+            conseil = (
+                "Surveillance recommandée."
+            )
 
-        except Exception as e:
+        elif score < 75:
 
-            st.error(f"Erreur IA : {e}")
+            label = "🟠 Stress modéré"
 
-else:
+            conseil = (
+                "Irrigation recommandée."
+            )
 
-    st.info(
-        "Cliquez sur 'Analyser la zone'"
-    )
+        else:
+
+            label = "🔴 Stress sévère"
+
+            conseil = (
+                "Irrigation urgente."
+            )
+
+        # ─────────────────────────────
+        # AFFICHAGE
+        # ─────────────────────────────
+        s1, s2, s3 = st.columns(3)
+
+        with s1:
+
+            st.metric(
+                "Score IA",
+                f"{score}/100"
+            )
+
+            st.progress(score / 100)
+
+        with s2:
+
+            st.markdown(f"## {label}")
+
+        with s3:
+
+            st.info(conseil)
+
+        # ─────────────────────────────
+        # DETAILS
+        # ─────────────────────────────
+        st.divider()
+
+        st.subheader("📈 Détails IA")
+
+        d1, d2 = st.columns(2)
+
+        with d1:
+
+            st.metric(
+                "Random Forest",
+                f"{rf_pred}"
+            )
+
+            st.metric(
+                "XGBoost",
+                f"{xgb_pred}"
+            )
+
+        with d2:
+
+            st.dataframe(features)
+
+    except Exception as e:
+
+        st.error(f"Erreur IA : {e}")
 
 # ─────────────────────────────────────────────
 # FOOTER
 # ─────────────────────────────────────────────
 st.divider()
 
-st.markdown(
-    """
-    PFE Agriculture 4.0 —
-    Détection précoce du stress hydrique
-    via Sentinel-2 et Intelligence Artificielle
-    """
-)
+st.markdown("""
+PFE Agriculture 4.0 —
+Détection précoce du stress hydrique
+via Sentinel-2, météo et Intelligence Artificielle
+""")
