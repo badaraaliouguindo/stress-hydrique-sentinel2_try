@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.express as px
 import plotly.graph_objects as go
 import folium
 from streamlit_folium import st_folium
@@ -8,661 +9,382 @@ import ee
 import requests
 import json
 import pickle
-
+import os
 from datetime import datetime
 
-# ─────────────────────────────────────────────
-# CONFIG PAGE
-# ─────────────────────────────────────────────
+# ── Configuration page
 st.set_page_config(
     page_title="Stress Hydrique Sentinel-2",
     page_icon="🌿",
     layout="wide"
 )
 
-# ─────────────────────────────────────────────
-# INITIALISATION GEE
-# ─────────────────────────────────────────────
+# ── Connexion GEE
 @st.cache_resource
 def init_gee():
-
     try:
-
         key_data = dict(st.secrets["gee"])
-
         credentials = ee.ServiceAccountCredentials(
             email=key_data["client_email"],
             key_data=json.dumps(key_data)
         )
-
         ee.Initialize(credentials)
-
         return True
-
     except Exception as e:
-
         st.error(f"Erreur GEE : {e}")
-
         return False
 
-
-gee_ok = init_gee()
-
-# ─────────────────────────────────────────────
-# CHARGEMENT MODELES IA
-# ─────────────────────────────────────────────
+# ── Charger les modèles
 @st.cache_resource
-def load_models():
+def charger_modeles():
+    base = os.path.dirname(__file__)
+    with open(os.path.join(base,"models","random_forest_v1.pkl"),"rb") as f:
+        rf = pickle.load(f)
+    with open(os.path.join(base,"models","xgboost_v1.pkl"),"rb") as f:
+        xgb = pickle.load(f)
+    with open(os.path.join(base,"models","scaler_v1.pkl"),"rb") as f:
+        scaler = pickle.load(f)
+    return rf, xgb, scaler
 
-    try:
+gee_ok     = init_gee()
+rf, xgb, scaler = charger_modeles()
 
-        model_dir = "dashboard/models"
+# ── Features attendues par les modèles
+FEATURES = ["NDVI","NDWI","MSI","NDRE","CRI","LAI",
+            "SPI_30j","deficit_cum_30j","HSI_cum_30j",
+            "temp_max","ETo","amplitude_thermique"]
 
-        with open(f"{model_dir}/random_forest_v1.pkl", "rb") as f:
-            rf_model = pickle.load(f)
+NOMS_LABELS = {
+    0:"✅ Pas de stress",
+    1:"⚠️ Risque",
+    2:"🟠 Stress modéré",
+    3:"🔴 Stress sévère"
+}
+COULEURS_LABELS = {
+    0:"#27AE60", 1:"#F39C12",
+    2:"#E67E22", 3:"#C0392B"
+}
 
-        with open(f"{model_dir}/xgboost_v1.pkl", "rb") as f:
-            xgb_model = pickle.load(f)
-
-        with open(f"{model_dir}/scaler_v1.pkl", "rb") as f:
-            scaler = pickle.load(f)
-
-        return rf_model, xgb_model, scaler
-
-    except Exception as e:
-
-        st.error(f"Erreur chargement modèles : {e}")
-
-        return None, None, None
-
-
-rf_model, xgb_model, scaler = load_models()
-
-# ─────────────────────────────────────────────
-# TITRE
-# ─────────────────────────────────────────────
+# ── Titre
 st.title("🌿 Détection du Stress Hydrique")
-st.markdown("### Irrigation intelligente via Sentinel-2 & IA")
+st.markdown("**Irrigation intelligente via Sentinel-2 & Données Météo**")
 st.divider()
 
-# ─────────────────────────────────────────────
-# SIDEBAR
-# ─────────────────────────────────────────────
+# ── Sidebar
 with st.sidebar:
-
     st.header("⚙️ Paramètres")
 
     st.subheader("📅 Période")
+    date_debut = st.date_input("Date début",
+                                value=datetime(2024,1,1),
+                                min_value=datetime(2020,1,1),
+                                max_value=datetime(2024,12,31))
+    date_fin = st.date_input("Date fin",
+                              value=datetime(2024,3,31),
+                              min_value=datetime(2020,1,1),
+                              max_value=datetime(2024,12,31))
 
-    date_debut = st.date_input(
-        "Date début",
-        value=datetime(2024, 1, 1)
-    )
+    st.subheader("🛰️ Indice spectral")
+    indice = st.selectbox("Indice à afficher",
+                          ["RGB (couleurs naturelles)",
+                           "NIR (fausses couleurs)",
+                           "NDVI","NDWI","MSI"])
 
-    date_fin = st.date_input(
-        "Date fin",
-        value=datetime(2024, 3, 31)
-    )
-
-    st.subheader("🛰️ Indice")
-
-    indice = st.selectbox(
-        "Indice à afficher",
-        [
-            "RGB",
-            "NIR",
-            "NDVI",
-            "NDWI",
-            "MSI"
-        ]
-    )
+    st.subheader("🤖 Modèle IA")
+    modele_choisi = st.radio("Choisir le modèle",
+                              ["Random Forest","XGBoost","Comparer les deux"])
 
     st.subheader("📍 Zone d'étude")
+    lat_centre = st.number_input("Latitude",  value=34.50, format="%.4f")
+    lon_centre = st.number_input("Longitude", value=-6.275, format="%.4f")
+    buffer_km  = st.slider("Rayon (km)", 5, 50, 15)
 
-    lat_centre = st.number_input(
-        "Latitude",
-        value=34.50,
-        format="%.4f"
-    )
+    analyser = st.button("🔍 Analyser",
+                         type="primary",
+                         use_container_width=True)
 
-    lon_centre = st.number_input(
-        "Longitude",
-        value=-6.275,
-        format="%.4f"
-    )
+# ── Carte
+st.subheader("🗺️ Carte Sentinel-2 Interactive")
+col_carte, col_info = st.columns([2,1])
 
-    buffer_km = st.slider(
-        "Rayon (km)",
-        5,
-        50,
-        15
-    )
-
-    analyser = st.button(
-        "🔍 Analyser",
-        type="primary",
-        width="stretch"
-    )
-
-# ─────────────────────────────────────────────
-# CARTE
-# ─────────────────────────────────────────────
-st.subheader("🗺️ Carte interactive")
-
-col_map, col_info = st.columns([2, 1])
-
-image = None
-zone = None
-
-with col_map:
-
+with col_carte:
     m = folium.Map(
         location=[lat_centre, lon_centre],
-        zoom_start=10,
+        zoom_start=11,
         tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
         attr="Google Satellite"
     )
 
     if gee_ok and analyser:
+        with st.spinner("⏳ Chargement Sentinel-2..."):
+            try:
+                zone = ee.Geometry.Point([lon_centre, lat_centre]).buffer(buffer_km*1000)
 
-        try:
+                def masquer(img):
+                    scl = img.select("SCL")
+                    mk = scl.eq(4).Or(scl.eq(5)).Or(scl.eq(6)).Or(scl.eq(7))
+                    return img.updateMask(mk).divide(10000)
 
-            zone = ee.Geometry.Point(
-                [lon_centre, lat_centre]
-            ).buffer(buffer_km * 1000)
+                col = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+                       .filterBounds(zone)
+                       .filterDate(str(date_debut), str(date_fin))
+                       .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE",20))
+                       .map(masquer))
 
-            def mask_clouds(img):
+                img = col.median()
 
-                scl = img.select("SCL")
+                if indice == "RGB (couleurs naturelles)":
+                    viz  = {"bands":["B4","B3","B2"],"min":0,"max":0.3,"gamma":1.4}
+                    img2 = img
+                elif indice == "NIR (fausses couleurs)":
+                    viz  = {"bands":["B8","B4","B3"],"min":0,"max":0.4,"gamma":1.4}
+                    img2 = img
+                elif indice == "NDVI":
+                    img2 = img.normalizedDifference(["B8","B4"])
+                    viz  = {"min":-0.2,"max":0.8,
+                            "palette":["d73027","f46d43","fdae61","ffffbf","a6d96a","1a9850"]}
+                elif indice == "NDWI":
+                    img2 = img.normalizedDifference(["B3","B8"])
+                    viz  = {"min":-0.8,"max":0.2,
+                            "palette":["d73027","f46d43","ffffbf","74add1","4575b4"]}
+                elif indice == "MSI":
+                    img2 = img.select("B11").divide(img.select("B8"))
+                    viz  = {"min":0.4,"max":1.5,
+                            "palette":["1a9850","a6d96a","ffffbf","f46d43","d73027"]}
 
-                mask = (
-                    scl.eq(4)
-                    .Or(scl.eq(5))
-                    .Or(scl.eq(6))
-                    .Or(scl.eq(7))
-                )
+                tile_url = img2.getMapId(viz)["tile_fetcher"].url_format
+                folium.TileLayer(
+                    tiles=tile_url,
+                    attr="GEE",
+                    name=f"Sentinel-2 — {indice}",
+                    overlay=True
+                ).add_to(m)
 
-                return img.updateMask(mask).divide(10000)
+                folium.Circle(
+                    location=[lat_centre, lon_centre],
+                    radius=buffer_km*1000,
+                    color="#97BC62",
+                    fill=True, fill_opacity=0.1
+                ).add_to(m)
 
-            collection = (
-                ee.ImageCollection(
-                    "COPERNICUS/S2_SR_HARMONIZED"
-                )
-                .filterBounds(zone)
-                .filterDate(
-                    str(date_debut),
-                    str(date_fin)
-                )
-                .filter(
-                    ee.Filter.lt(
-                        "CLOUDY_PIXEL_PERCENTAGE",
-                        20
-                    )
-                )
-                .map(mask_clouds)
-            )
+                folium.LayerControl().add_to(m)
+                st.success(f"✅ {indice} chargé !")
 
-            image = collection.median()
-
-            if indice == "RGB":
-
-                viz = {
-                    "bands": ["B4", "B3", "B2"],
-                    "min": 0,
-                    "max": 0.3
-                }
-
-            elif indice == "NIR":
-
-                viz = {
-                    "bands": ["B8", "B4", "B3"],
-                    "min": 0,
-                    "max": 0.4
-                }
-
-            elif indice == "NDVI":
-
-                image = image.normalizedDifference(
-                    ["B8", "B4"]
-                )
-
-                viz = {
-                    "min": -0.2,
-                    "max": 0.8,
-                    "palette": [
-                        "red",
-                        "yellow",
-                        "green"
-                    ]
-                }
-
-            elif indice == "NDWI":
-
-                image = image.normalizedDifference(
-                    ["B3", "B8"]
-                )
-
-                viz = {
-                    "min": -0.5,
-                    "max": 0.5,
-                    "palette": [
-                        "brown",
-                        "yellow",
-                        "blue"
-                    ]
-                }
-
-            elif indice == "MSI":
-
-                image = image.select(
-                    "B11"
-                ).divide(
-                    image.select("B8")
-                )
-
-                viz = {
-                    "min": 0.4,
-                    "max": 1.5,
-                    "palette": [
-                        "green",
-                        "yellow",
-                        "red"
-                    ]
-                }
-
-            map_id = image.getMapId(viz)
-
-            folium.TileLayer(
-                tiles=map_id["tile_fetcher"].url_format,
-                attr="Google Earth Engine",
-                overlay=True,
-                name=indice
-            ).add_to(m)
-
-            folium.Circle(
-                location=[lat_centre, lon_centre],
-                radius=buffer_km * 1000,
-                color="green",
-                fill=True,
-                fill_opacity=0.1
-            ).add_to(m)
-
-            folium.LayerControl().add_to(m)
-
-            st.success("Image Sentinel-2 chargée")
-
-        except Exception as e:
-
-            st.error(f"Erreur GEE : {e}")
+            except Exception as e:
+                st.error(f"Erreur : {e}")
 
     st_folium(m, width=700, height=500)
 
 with col_info:
-
-    st.subheader("📊 Informations")
-
+    st.subheader("ℹ️ Informations")
     st.info(f"""
-    Latitude : {lat_centre}
+    **Zone analysée**
+    - Lat : {lat_centre}°N
+    - Lon : {lon_centre}°W
+    - Rayon : {buffer_km} km
 
-    Longitude : {lon_centre}
+    **Période**
+    - Du : {date_debut}
+    - Au : {date_fin}
 
-    Rayon : {buffer_km} km
-
-    Période :
-    {date_debut} → {date_fin}
-
-    Indice :
-    {indice}
+    **Indice :** {indice}
+    **Modèle :** {modele_choisi}
     """)
-
     if gee_ok:
-        st.success("GEE connecté")
+        st.success("🛰️ GEE connecté")
     else:
-        st.error("GEE non connecté")
+        st.error("❌ GEE non connecté")
 
-# ─────────────────────────────────────────────
-# METEO
-# ─────────────────────────────────────────────
+# ── Météo
 st.divider()
-
-st.subheader("🌦️ Données météo")
+st.subheader("🌦️ Données Météo")
 
 @st.cache_data(ttl=3600)
 def get_meteo(lat, lon, debut, fin):
-
     url = "https://archive-api.open-meteo.com/v1/archive"
-
     params = {
-        "latitude": lat,
-        "longitude": lon,
-        "start_date": str(debut),
-        "end_date": str(fin),
-        "daily": [
-            "temperature_2m_max",
-            "temperature_2m_min",
-            "precipitation_sum",
-            "et0_fao_evapotranspiration"
-        ],
-        "timezone": "Africa/Casablanca"
+        "latitude":lat, "longitude":lon,
+        "start_date":str(debut), "end_date":str(fin),
+        "daily":["temperature_2m_max","temperature_2m_min",
+                 "precipitation_sum","et0_fao_evapotranspiration",
+                 "windspeed_10m_max"],
+        "timezone":"Africa/Casablanca"
     }
-
     r = requests.get(url, params=params)
-
     if r.status_code == 200:
-
-        data = r.json()["daily"]
-
-        df = pd.DataFrame(data)
-
+        d = r.json()["daily"]
+        df = pd.DataFrame(d)
         df["time"] = pd.to_datetime(df["time"])
-
-        df["deficit"] = (
-            df["precipitation_sum"]
-            - df["et0_fao_evapotranspiration"]
-        )
-
+        df["deficit"] = df["precipitation_sum"] - df["et0_fao_evapotranspiration"]
+        df["amplitude"] = df["temperature_2m_max"] - df["temperature_2m_min"]
         return df
-
     return None
 
-
-df_meteo = None
-
 if analyser:
-
-    df_meteo = get_meteo(
-        lat_centre,
-        lon_centre,
-        date_debut,
-        date_fin
-    )
+    with st.spinner("⏳ Chargement météo..."):
+        df_meteo = get_meteo(lat_centre, lon_centre, date_debut, date_fin)
 
     if df_meteo is not None:
+        # KPIs
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Temp. max moy",   f"{df_meteo['temperature_2m_max'].mean():.1f}°C")
+        c2.metric("Précip. totale",  f"{df_meteo['precipitation_sum'].sum():.0f} mm")
+        c3.metric("ETo moy",         f"{df_meteo['et0_fao_evapotranspiration'].mean():.2f} mm/j")
+        deficit_moy = df_meteo["deficit"].mean()
+        c4.metric("Déficit moy",     f"{deficit_moy:.2f} mm/j",
+                  delta="Stress ⚠️" if deficit_moy < -3 else "Normal ✅")
 
-        c1, c2, c3, c4 = st.columns(4)
+        # Graphiques
+        col_g1, col_g2 = st.columns(2)
 
-        with c1:
-            st.metric(
-                "Température max",
-                f"{df_meteo['temperature_2m_max'].mean():.1f} °C"
-            )
+        with col_g1:
+            fig1 = go.Figure()
+            fig1.add_trace(go.Scatter(
+                x=df_meteo["time"], y=df_meteo["temperature_2m_max"],
+                name="Temp. max", line=dict(color="#E74C3C")))
+            fig1.add_trace(go.Scatter(
+                x=df_meteo["time"], y=df_meteo["temperature_2m_min"],
+                name="Temp. min", line=dict(color="#3498DB")))
+            fig1.add_hline(y=35, line_dash="dash",
+                           line_color="orange",
+                           annotation_text="Seuil 35°C")
+            fig1.update_layout(
+                title="Températures (°C)",
+                plot_bgcolor="#0D1F35",
+                paper_bgcolor="#0A1628",
+                font_color="white")
+            st.plotly_chart(fig1, use_container_width=True)
 
-        with c2:
-            st.metric(
-                "Précipitations",
-                f"{df_meteo['precipitation_sum'].sum():.1f} mm"
-            )
-
-        with c3:
-            st.metric(
-                "ETo",
-                f"{df_meteo['et0_fao_evapotranspiration'].mean():.2f}"
-            )
-
-        with c4:
-            st.metric(
-                "Déficit",
-                f"{df_meteo['deficit'].mean():.2f}"
-            )
-
-        fig = go.Figure()
-
-        fig.add_trace(
-            go.Scatter(
+        with col_g2:
+            fig2 = go.Figure()
+            fig2.add_trace(go.Bar(
+                x=df_meteo["time"], y=df_meteo["precipitation_sum"],
+                name="Précipitations", marker_color="#3498DB"))
+            fig2.add_trace(go.Scatter(
                 x=df_meteo["time"],
-                y=df_meteo["temperature_2m_max"],
-                name="Température max"
-            )
-        )
+                y=df_meteo["et0_fao_evapotranspiration"],
+                name="ETo", line=dict(color="#E74C3C")))
+            fig2.update_layout(
+                title="Précipitations vs ETo",
+                plot_bgcolor="#0D1F35",
+                paper_bgcolor="#0A1628",
+                font_color="white")
+            st.plotly_chart(fig2, use_container_width=True)
 
-        fig.add_trace(
-            go.Scatter(
-                x=df_meteo["time"],
-                y=df_meteo["temperature_2m_min"],
-                name="Température min"
-            )
-        )
+        # Déficit
+        fig3 = go.Figure()
+        fig3.add_trace(go.Bar(
+            x=df_meteo["time"], y=df_meteo["deficit"],
+            marker_color=["#27AE60" if v>=0 else "#E74C3C"
+                         for v in df_meteo["deficit"]],
+            name="Déficit hydrique"))
+        fig3.add_hline(y=0, line_color="white", line_width=1)
+        fig3.update_layout(
+            title="Déficit Hydrique (Précip - ETo)",
+            plot_bgcolor="#0D1F35",
+            paper_bgcolor="#0A1628",
+            font_color="white")
+        st.plotly_chart(fig3, use_container_width=True)
 
-        st.plotly_chart(
-            fig,
-            width="stretch"
-        )
-
-# ─────────────────────────────────────────────
-# IA
-# ─────────────────────────────────────────────
-st.divider()
-
-st.subheader("🤖 Analyse IA")
-
-if (
-    analyser
-    and df_meteo is not None
-    and image is not None
-):
-
-    try:
-
-        # ─────────────────────────────
-        # VARIABLES METEO
-        # ─────────────────────────────
-        temp_max = df_meteo[
-            "temperature_2m_max"
-        ].mean()
-
-        eto = df_meteo[
-            "et0_fao_evapotranspiration"
-        ].mean()
-
-        amplitude = (
-            df_meteo["temperature_2m_max"]
-            - df_meteo["temperature_2m_min"]
-        ).mean()
-
-        # ─────────────────────────────
-        # NDVI
-        # ─────────────────────────────
-        try:
-
-            ndvi_img = image.normalizedDifference(
-                ["B8", "B4"]
-            )
-
-            ndvi_val = ndvi_img.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=zone,
-                scale=20
-            ).getInfo()
-
-            ndvi = list(
-                ndvi_val.values()
-            )[0]
-
-        except:
-            ndvi = 0
-
-        # ─────────────────────────────
-        # NDWI
-        # ─────────────────────────────
-        try:
-
-            ndwi_img = image.normalizedDifference(
-                ["B3", "B8"]
-            )
-
-            ndwi_val = ndwi_img.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=zone,
-                scale=20
-            ).getInfo()
-
-            ndwi = list(
-                ndwi_val.values()
-            )[0]
-
-        except:
-            ndwi = 0
-
-        # ─────────────────────────────
-        # MSI
-        # ─────────────────────────────
-        try:
-
-            msi_img = image.select(
-                "B11"
-            ).divide(
-                image.select("B8")
-            )
-
-            msi_val = msi_img.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=zone,
-                scale=20
-            ).getInfo()
-
-            msi = list(
-                msi_val.values()
-            )[0]
-
-        except:
-            msi = 0
-
-        # ─────────────────────────────
-        # FEATURES APPROXIMATIVES
-        # ─────────────────────────────
-        ndre = ndvi * 0.85
-        cri = (1 - ndvi) * 0.5
-        lai = ndvi * 3
-
-        # ─────────────────────────────
-        # FEATURES FINALES
-        # ─────────────────────────────
-        features = pd.DataFrame([{
-            "NDVI": ndvi,
-            "NDWI": ndwi,
-            "MSI": msi,
-            "NDRE": ndre,
-            "CRI": cri,
-            "LAI": lai,
-            "SPI_30j": 0,
-            "deficit_cum_30j": 0,
-            "HSI_cum_30j": 0,
-            "temp_max": temp_max,
-            "ETo": eto,
-            "amplitude_thermique": amplitude
-        }])
-
-        # ─────────────────────────────
-        # SCALE
-        # ─────────────────────────────
-        X_scaled = scaler.transform(features)
-
-        # ─────────────────────────────
-        # PREDICTIONS
-        # ─────────────────────────────
-        rf_pred = rf_model.predict(X_scaled)[0]
-
-        xgb_pred = xgb_model.predict(X_scaled)[0]
-
-        score = int(
-            ((rf_pred + xgb_pred) / 2) * 33
-        )
-
-        score = max(0, min(score, 100))
-
-        # ─────────────────────────────
-        # LABELS
-        # ─────────────────────────────
-        if score < 25:
-
-            label = "✅ Pas de stress"
-
-            conseil = (
-                "Aucune irrigation nécessaire."
-            )
-
-        elif score < 50:
-
-            label = "⚠️ Risque"
-
-            conseil = (
-                "Surveillance recommandée."
-            )
-
-        elif score < 75:
-
-            label = "🟠 Stress modéré"
-
-            conseil = (
-                "Irrigation recommandée."
-            )
-
-        else:
-
-            label = "🔴 Stress sévère"
-
-            conseil = (
-                "Irrigation urgente."
-            )
-
-        # ─────────────────────────────
-        # AFFICHAGE
-        # ─────────────────────────────
-        s1, s2, s3 = st.columns(3)
-
-        with s1:
-
-            st.metric(
-                "Score IA",
-                f"{score}/100"
-            )
-
-            st.progress(score / 100)
-
-        with s2:
-
-            st.markdown(f"## {label}")
-
-        with s3:
-
-            st.info(conseil)
-
-        # ─────────────────────────────
-        # DETAILS
-        # ─────────────────────────────
+        # ── Score IA avec vrais modèles
         st.divider()
+        st.subheader("🤖 Score IA — Prédiction du Stress Hydrique")
 
-        st.subheader("📈 Détails IA")
+        # Calculer les features pour le modèle
+        temp_max    = df_meteo["temperature_2m_max"].mean()
+        precip      = df_meteo["precipitation_sum"].mean()
+        eto         = df_meteo["et0_fao_evapotranspiration"].mean()
+        amplitude   = df_meteo["amplitude"].mean()
+        deficit_j   = df_meteo["deficit"].mean()
 
-        d1, d2 = st.columns(2)
+        # Cumul 30j
+        deficit_cum = df_meteo["deficit"].sum()
+        hsi         = (df_meteo["temperature_2m_max"] > 35).sum()
 
-        with d1:
+        # Valeurs approximées pour features satellite
+        # (calculées depuis la période météo)
+        ndvi_est = max(0.1, 0.6 - max(0, -deficit_j)*0.05)
+        ndwi_est = -0.3 - max(0, -deficit_j)*0.03
+        msi_est  = min(1.5, 0.7 + max(0, -deficit_j)*0.04)
+        ndre_est = max(0.05, ndvi_est * 0.65)
+        cri_est  = max(1.0, 8.0 - ndvi_est * 10)
+        lai_est  = max(0.1, ndvi_est * 4.5)
 
-            st.metric(
-                "Random Forest",
-                f"{rf_pred}"
-            )
+        # SPI simplifié
+        spi_30j = max(-2, min(2, deficit_cum / 50))
 
-            st.metric(
-                "XGBoost",
-                f"{xgb_pred}"
-            )
+        # Vecteur features
+        X_pred = np.array([[ndvi_est, ndwi_est, msi_est, ndre_est,
+                            cri_est, lai_est, spi_30j, deficit_cum,
+                            float(hsi), temp_max, eto, amplitude]])
 
-        with d2:
+        X_pred_sc = scaler.transform(X_pred)
 
-            st.dataframe(features)
+        # Prédictions
+        pred_rf  = rf.predict(X_pred_sc)[0]
+        prob_rf  = rf.predict_proba(X_pred_sc)[0]
+        pred_xgb = xgb.predict(X_pred_sc)[0]
+        prob_xgb = xgb.predict_proba(X_pred_sc)[0]
 
-    except Exception as e:
+        # Affichage selon choix modèle
+        if modele_choisi == "Random Forest":
+            predictions = [("Random Forest", pred_rf, prob_rf)]
+        elif modele_choisi == "XGBoost":
+            predictions = [("XGBoost", pred_xgb, prob_xgb)]
+        else:
+            predictions = [
+                ("Random Forest", pred_rf,  prob_rf),
+                ("XGBoost",       pred_xgb, prob_xgb)
+            ]
 
-        st.error(f"Erreur IA : {e}")
+        for nom_modele, pred, prob in predictions:
+            st.markdown(f"### 📊 {nom_modele}")
+            col_pred1, col_pred2, col_pred3 = st.columns(3)
 
-# ─────────────────────────────────────────────
-# FOOTER
-# ─────────────────────────────────────────────
-st.divider()
+            with col_pred1:
+                score = int(prob[min(pred, 3)] * 100)
+                st.metric("Confiance", f"{score}%")
+                st.progress(score/100)
 
-st.markdown("""
-PFE Agriculture 4.0 —
-Détection précoce du stress hydrique
-via Sentinel-2, météo et Intelligence Artificielle
-""")
+            with col_pred2:
+                label_nom = NOMS_LABELS[pred]
+                st.markdown("**Niveau de stress :**")
+                st.markdown(f"## {label_nom}")
+
+            with col_pred3:
+                # Probabilités par classe
+                fig_prob = go.Figure(go.Bar(
+                    x=[NOMS_LABELS[i] for i in range(4)],
+                    y=[p*100 for p in prob],
+                    marker_color=[COULEURS_LABELS[i] for i in range(4)]
+                ))
+                fig_prob.update_layout(
+                    title="Probabilités par classe",
+                    plot_bgcolor="#0D1F35",
+                    paper_bgcolor="#0A1628",
+                    font_color="white",
+                    height=250,
+                    margin=dict(t=30,b=0,l=0,r=0)
+                )
+                st.plotly_chart(fig_prob, use_container_width=True)
+
+            # Recommandation
+            if pred == 0:
+                st.success("✅ Aucune irrigation nécessaire. Prochaine vérification dans 15 jours.")
+            elif pred == 1:
+                eau = abs(deficit_j) * 0.7 * 7
+                st.warning(f"⚠️ Irrigation préventive recommandée dans les 7 jours.\n💧 Quantité estimée : {eau:.1f} mm")
+            elif pred == 2:
+                eau = abs(deficit_j) * 0.8 * 3
+                st.warning(f"🟠 Irrigation recommandée dans les 48h.\n💧 Quantité estimée : {eau:.1f} mm")
+            else:
+                eau = abs(deficit_j) * 1.0
+                st.error(f"🔴 IRRIGATION URGENTE — Intervenir dans les 24h !\n💧 Quantité estimée : {eau:.1f} mm/jour")
+
+            st.divider()
+
+else:
+    st.info("👆 Définissez une zone et cliquez sur **Analyser** pour obtenir les prédictions.")
+
+# ── Footer
+st.markdown("*PFE Agriculture 4.0 — Badaraa Liou Guindo — Avril 2026*")
